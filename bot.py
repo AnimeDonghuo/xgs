@@ -1,12 +1,13 @@
 import os
 import re
 import json
+import asyncio
 import threading
 import yt_dlp
 from urllib.parse import urljoin
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -78,17 +79,17 @@ def find_series_title_in_dict(d):
                 return res
     return None
 
-# --- Extraction Engine using Playwright ---
+# --- Async Extraction Engine using Playwright ---
 
-def get_direct_video_url_via_playwright(url, debug_info=None):
-    """Launches headless Chromium, runs JS, and captures the video stream URL."""
+async def get_direct_video_url_via_playwright(url, debug_info=None):
+    """Launches headless Chromium asynchronously, runs JS, and captures the video stream URL."""
     if '.mp4' in url or '.m3u8' in url:
         return url, "Direct Input Link"
         
     video_url = None
     proxy_config = get_playwright_proxy()
     
-    with sync_playwright() as p:
+    async with async_playwright() as p:
         launch_kwargs = {
             "headless": True,
             "args": ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
@@ -97,38 +98,40 @@ def get_direct_video_url_via_playwright(url, debug_info=None):
             launch_kwargs["proxy"] = proxy_config
             
         try:
-            browser = p.chromium.launch(**launch_kwargs)
-            context = browser.new_context(
+            browser = await p.chromium.launch(**launch_kwargs)
+            context = await browser.new_context(
                 user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
             )
-            page = context.new_page()
+            page = await context.new_page()
             
-            # Intercept background network responses to catch the dynamic video stream URL
-            def handle_response(response):
+            # Intercept background network responses to catch dynamic video stream links
+            async def handle_response(response):
                 nonlocal video_url
                 r_url = response.url
                 if any(x in r_url.lower() for x in ['.m3u8', '.mp4', 'stream', 'video_url', 'play_url']):
-                    # Filter out static resources
                     if not any(ext in r_url.lower() for ext in ['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.css', '.js']):
                         video_url = r_url
                         
             page.on("response", handle_response)
             
             try:
-                response = page.goto(url, wait_until="networkidle", timeout=25000)
-                if response and response.status in [301, 302, 307, 308] and 't.me' in response.header_value('location'):
-                    return None, "Anti-bot redirect to Telegram. Datacenter IP is blocked. Proxy is required."
+                response = await page.goto(url, wait_until="networkidle", timeout=25000)
+                if response and response.status in [301, 302, 307, 308]:
+                    loc = await response.header_value('location')
+                    if loc and 't.me' in loc:
+                        await browser.close()
+                        return None, "Anti-bot redirect to Telegram. Datacenter IP is blocked. Proxy is required."
                 
-                # Wait 5 seconds for the player scripts to execute and load media sources
-                page.wait_for_timeout(5000)
+                # Wait for the player scripts to execute and load media sources
+                await page.wait_for_timeout(5000)
             except Exception as e:
                 if debug_info is not None:
                     debug_info['html_preview'] = f"Navigation timeout/error: {str(e)}"
                     
-            # Fallback 1: Extract from the DOM <video> element
+            # Fallback 1: Extract from DOM <video> element
             if not video_url:
                 try:
-                    video_src = page.eval_on_selector("video", "el => el.src")
+                    video_src = await page.eval_on_selector("video", "el => el.src")
                     if video_src and not video_src.startswith("blob:"):
                         video_url = video_src
                 except Exception:
@@ -137,16 +140,16 @@ def get_direct_video_url_via_playwright(url, debug_info=None):
             # Fallback 2: Extract from <video><source> tag
             if not video_url:
                 try:
-                    video_src = page.eval_on_selector("video source", "el => el.src")
+                    video_src = await page.eval_on_selector("video source", "el => el.src")
                     if video_src and not video_src.startswith("blob:"):
                         video_url = video_src
                 except Exception:
                     pass
                     
             if debug_info is not None and not video_url:
-                debug_info['html_preview'] = page.content()[:400]
+                debug_info['html_preview'] = (await page.content())[:400]
                 
-            browser.close()
+            await browser.close()
         except Exception as e:
             return None, f"Playwright Engine Error: {str(e)}"
             
@@ -154,13 +157,13 @@ def get_direct_video_url_via_playwright(url, debug_info=None):
         return video_url, "Playwright Browser Emulation"
     return None, "No active media stream found on page"
 
-def parse_xgshort_series_via_playwright(url, debug_info=None):
+async def parse_xgshort_series_via_playwright(url, debug_info=None):
     """Loads the SPA series page and extracts dynamic list of episodes."""
     episodes = []
     series_title = "Short Drama"
     proxy_config = get_playwright_proxy()
     
-    with sync_playwright() as p:
+    async with async_playwright() as p:
         launch_kwargs = {
             "headless": True,
             "args": ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
@@ -169,18 +172,18 @@ def parse_xgshort_series_via_playwright(url, debug_info=None):
             launch_kwargs["proxy"] = proxy_config
             
         try:
-            browser = p.chromium.launch(**launch_kwargs)
-            context = browser.new_context(
+            browser = await p.chromium.launch(**launch_kwargs)
+            context = await browser.new_context(
                 user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
             )
-            page = context.new_page()
+            page = await context.new_page()
             
-            # Intercept API responses containing episode list data
-            def handle_response(response):
+            # Intercept API responses containing episode list JSON data
+            async def handle_response(response):
                 nonlocal episodes, series_title
                 try:
                     if "application/json" in response.headers.get("content-type", ""):
-                        data = response.json()
+                        data = await response.json()
                         found_eps = find_episodes_in_dict(data)
                         found_title = find_series_title_in_dict(data)
                         if found_title:
@@ -206,21 +209,21 @@ def parse_xgshort_series_via_playwright(url, debug_info=None):
             page.on("response", handle_response)
             
             try:
-                page.goto(url, wait_until="networkidle", timeout=25000)
-                page.wait_for_timeout(5000) # Wait for API execution
+                await page.goto(url, wait_until="networkidle", timeout=25000)
+                await page.wait_for_timeout(5000) # Wait for network execution
             except Exception:
                 pass
                 
             # Fallback: Scrape the parsed DOM links containing 'eid='
             if not episodes:
                 try:
-                    html_content = page.content()
+                    html_content = await page.content()
                     soup = BeautifulSoup(html_content, 'html.parser')
                     title_tag = soup.find('title')
                     if title_tag:
                         series_title = title_tag.string.strip()
                         
-                    links = page.eval_on_selector_all("a", "elements => elements.map(el => el.href)")
+                    links = await page.eval_on_selector_all("a", "elements => elements.map(el => el.href)")
                     unique_links = list(dict.fromkeys(links))
                     idx = 1
                     for link in unique_links:
@@ -233,7 +236,7 @@ def parse_xgshort_series_via_playwright(url, debug_info=None):
                 except Exception:
                     pass
                     
-            browser.close()
+            await browser.close()
         except Exception as e:
             if debug_info is not None:
                 debug_info['html_preview'] = f"Playwright Error: {str(e)}"
@@ -246,6 +249,7 @@ def parse_xgshort_series_via_playwright(url, debug_info=None):
 # --- Downloading Engine ---
 
 def download_and_save(video_url, output_path):
+    """Synchronous downloader called via background worker to avoid blocking the event loop."""
     ydl_opts = {
         'outtmpl': output_path,
         'format': 'bestvideo+bestaudio/best',
@@ -257,6 +261,11 @@ def download_and_save(video_url, output_path):
         ydl_opts['proxy'] = PROXY
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([video_url])
+
+async def download_and_save_async(video_url, output_path):
+    """Wraps synchronous yt-dlp call in a non-blocking asyncio thread worker."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, download_and_save, video_url, output_path)
 
 # --- Telegram Bot Commands ---
 
@@ -274,10 +283,10 @@ async def download_single(client, message: Message):
         return
 
     target_url = message.command[1]
-    status = await message.reply_text("Opening headless browser to load SPA contents...")
+    status = await message.reply_text("Opening headless browser asynchronously...")
 
     debug_info = {}
-    direct_url, method = get_direct_video_url_via_playwright(target_url, debug_info)
+    direct_url, method = await get_direct_video_url_via_playwright(target_url, debug_info)
 
     if not direct_url:
         preview = debug_info.get('html_preview', 'No content captured').replace('<', '&lt;').replace('>', '&gt;')
@@ -290,10 +299,10 @@ async def download_single(client, message: Message):
         return
 
     output_filename = "episode.mp4"
-    await status.edit_text(f"Detected stream via **{method}**.\nDownloading media file...")
+    await status.edit_text(f"Detected stream via **{method}**.\nDownloading media file in background...")
 
     try:
-        download_and_save(direct_url, output_filename)
+        await download_and_save_async(direct_url, output_filename)
 
         if os.path.exists(output_filename):
             await status.edit_text("Uploading file to Telegram...")
@@ -304,7 +313,7 @@ async def download_single(client, message: Message):
             os.remove(output_filename) 
             await status.delete()
         else:
-            await status.edit_text("Download succeeded but file path was empty.")
+            await status.edit_text("Download succeeded but output file was not created.")
     except Exception as e:
         await status.edit_text(f"An error occurred during download: {str(e)}")
         if os.path.exists(output_filename):
@@ -320,7 +329,7 @@ async def download_batch(client, message: Message):
     status = await message.reply_text("Opening headless browser to read series data...")
 
     debug_info = {}
-    series_data = parse_xgshort_series_via_playwright(series_url, debug_info)
+    series_data = await parse_xgshort_series_via_playwright(series_url, debug_info)
     
     if not series_data or not series_data.get('episodes'):
         preview = debug_info.get('html_preview', 'No content captured').replace('<', '&lt;').replace('>', '&gt;')
@@ -335,7 +344,7 @@ async def download_batch(client, message: Message):
     title = series_data['title']
     total_eps = len(episodes)
 
-    await status.edit_text(f"Found series: **{title}**\nTotal: {total_eps} episodes.\nBeginning download process...")
+    await status.edit_text(f"Found series: **{title}**\nTotal: {total_eps} episodes.\nBeginning sequential download...")
 
     for i, ep in enumerate(episodes, start=1):
         ep_title = ep['title']
@@ -346,13 +355,13 @@ async def download_batch(client, message: Message):
 
         try:
             ep_debug = {}
-            direct_url, method = get_direct_video_url_via_playwright(ep_url, ep_debug)
+            direct_url, method = await get_direct_video_url_via_playwright(ep_url, ep_debug)
             
             if not direct_url:
                 await step_msg.edit_text(f"❌ Failed to extract stream link for {ep_title}. Skipping.")
                 continue
 
-            download_and_save(direct_url, temp_file)
+            await download_and_save_async(direct_url, temp_file)
 
             if os.path.exists(temp_file):
                 await step_msg.edit_text(f"Uploading ({i}/{total_eps}): {ep_title}...")
