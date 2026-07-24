@@ -3,3 +3,4 @@ tgcrypto
 yt-dlp
 beautifulsoup4
 requests
+playwright
