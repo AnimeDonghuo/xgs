@@ -2,11 +2,11 @@ import os
 import re
 import json
 import threading
-import requests
 import yt_dlp
 from urllib.parse import urljoin
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -15,8 +15,7 @@ API_ID = int(os.environ.get("API_ID", "1234567"))
 API_HASH = os.environ.get("API_HASH", "your_api_hash_here")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token_here")
 
-# Proxy Configuration (Optional: set PROXY in Koyeb Environment Variables)
-# e.g., PROXY = "http://username:password@ip:port" or "socks5://ip:port"
+# Optional Proxy Configuration
 PROXY = os.environ.get("PROXY", "")
 
 app = Client("xgshort_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -42,216 +41,12 @@ threading.Thread(target=run_health_server, daemon=True).start()
 
 # --- Helper Functions ---
 
-def get_requests_proxies():
+def get_playwright_proxy():
     if PROXY:
         return {
-            "http": PROXY,
-            "https": PROXY
+            "server": PROXY
         }
     return None
-
-def find_urls_in_dict_recursively(d, base_url, found=None):
-    if found is None:
-        found = []
-    if isinstance(d, dict):
-        for k, v in d.items():
-            k_lower = k.lower()
-            if isinstance(v, str):
-                if v.startswith('http://') or v.startswith('https://') or v.startswith('/'):
-                    if any(x in k_lower for x in ['video', 'play', 'src', 'stream', 'source', 'url', 'm3u8', 'mp4', 'file']):
-                        abs_url = urljoin(base_url, v)
-                        if not any(abs_url.lower().endswith(ext) or ext + '?' in abs_url.lower() for ext in ['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.css', '.js']):
-                            found.append((abs_url, k))
-            else:
-                find_urls_in_dict_recursively(v, base_url, found)
-    elif isinstance(d, list):
-        for item in d:
-            find_urls_in_dict_recursively(item, base_url, found)
-    return found
-
-def get_direct_video_url(url, debug_info=None):
-    if '.mp4' in url or '.m3u8' in url:
-        return url, "Direct Input Link"
-        
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://m.xgshort.com/',
-        'Origin': 'https://m.xgshort.com'
-    }
-    
-    proxies = get_requests_proxies()
-    
-    try:
-        # Disable default automatic redirects to catch anti-bot redirects to t.me
-        response = requests.get(url, headers=headers, timeout=10, allow_redirects=False, proxies=proxies)
-        
-        if debug_info is not None:
-            debug_info['status_code'] = response.status_code
-            
-        # Manually trace redirections to catch blocks early
-        redirect_count = 0
-        while response.status_code in [301, 302, 303, 307, 308] and redirect_count < 5:
-            redirect_url = response.headers.get('Location', '')
-            if not redirect_url:
-                break
-                
-            redirect_url = urljoin(url, redirect_url)
-            
-            # If redirected to Telegram, stop the request and report the datacenter block
-            if 't.me' in redirect_url:
-                return None, (
-                    f"Anti-bot redirect detected! The website redirected the bot to their Telegram channel ({redirect_url}). "
-                    "This occurs when the website blocks hosting/datacenter IP ranges (like Koyeb). "
-                    "Setting up a residential or clean HTTP proxy under the 'PROXY' environment variable on Koyeb is recommended to bypass this."
-                )
-                
-            url = redirect_url
-            response = requests.get(url, headers=headers, timeout=10, allow_redirects=False, proxies=proxies)
-            redirect_count += 1
-            
-        if debug_info is not None:
-            debug_info['status_code'] = response.status_code
-            debug_info['html_preview'] = response.text[:400]
-            
-        if response.status_code != 200:
-            return None, f"HTTP Status {response.status_code}"
-            
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Strategy 1: Check native HTML5 <video> tags
-        video_tag = soup.find('video')
-        if video_tag:
-            src = video_tag.get('src')
-            if src:
-                return urljoin(url, src), "HTML5 Video Tag"
-                
-        # Strategy 2: Check standard <source> elements
-        source_tag = soup.find('source')
-        if source_tag:
-            src = source_tag.get('src')
-            if src:
-                return urljoin(url, src), "HTML5 Source Tag"
-                
-        # Strategy 3: Check NextJS React hydrated structures
-        next_script = soup.find('script', id='__NEXT_DATA__')
-        if next_script:
-            try:
-                data = json.loads(next_script.string)
-                found_pairs = find_urls_in_dict_recursively(data, url)
-                if found_pairs:
-                    return found_pairs[0][0], f"NextJS State Key: {found_pairs[0][1]}"
-            except Exception:
-                pass
-                
-        # Strategy 4: Raw text javascript variables pattern scanner
-        for script in soup.find_all('script'):
-            if script.string:
-                patterns = [
-                    r'["\'](?:video|play|src|source|stream|url)["\']\s*[:=]\s*["\'](https?://[^"\']+|/[^"\']+)["\']',
-                    r'(?:video|play|src|source|stream|url)\s*=\s*["\'](https?://[^"\']+|/[^"\']+)["\']'
-                ]
-                for pattern in patterns:
-                    matches = re.findall(pattern, script.string, re.IGNORECASE)
-                    for match in matches:
-                        abs_url = urljoin(url, match)
-                        if not any(abs_url.lower().endswith(ext) or ext + '?' in abs_url.lower() for ext in ['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.css', '.js']):
-                            return abs_url, "Script Variable Extract"
-                            
-    except Exception as e:
-        return None, f"Network Exception: {str(e)}"
-        
-    return None, "Unable to extract playable media stream"
-
-def parse_xgshort_series(url, debug_info=None):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://m.xgshort.com/',
-        'Origin': 'https://m.xgshort.com'
-    }
-    proxies = get_requests_proxies()
-    try:
-        response = requests.get(url, headers=headers, timeout=10, allow_redirects=False, proxies=proxies)
-        
-        # Trace redirect to prevent timeouts on parse
-        redirect_count = 0
-        while response.status_code in [301, 302, 303, 307, 308] and redirect_count < 5:
-            redirect_url = response.headers.get('Location', '')
-            if not redirect_url:
-                break
-            redirect_url = urljoin(url, redirect_url)
-            if 't.me' in redirect_url:
-                if debug_info is not None:
-                    debug_info['status_code'] = response.status_code
-                    debug_info['html_preview'] = f"Anti-bot redirect to Telegram ({redirect_url}) detected. Please set up a PROXY environment variable on Koyeb."
-                return None
-            url = redirect_url
-            response = requests.get(url, headers=headers, timeout=10, allow_redirects=False, proxies=proxies)
-            redirect_count += 1
-
-        if debug_info is not None:
-            debug_info['status_code'] = response.status_code
-            debug_info['html_preview'] = response.text[:400]
-    except Exception as e:
-        if debug_info is not None:
-            debug_info['status_code'] = 'Exception'
-            debug_info['html_preview'] = str(e)
-        return None
-
-    if response.status_code != 200:
-        return None
-
-    soup = BeautifulSoup(response.text, 'html.parser')
-    series_title = "Short Drama"
-    title_tag = soup.find('title')
-    if title_tag:
-        series_title = title_tag.string.strip()
-
-    episodes = []
-    next_script = soup.find('script', id='__NEXT_DATA__')
-    if next_script:
-        try:
-            data = json.loads(next_script.string)
-            episodes_list = find_episodes_in_dict(data)
-            series_title_extracted = find_series_title_in_dict(data)
-            if series_title_extracted:
-                series_title = series_title_extracted
-
-            if episodes_list:
-                for idx, ep in enumerate(episodes_list):
-                    eid = ep.get('eid') or ep.get('id') or ep.get('episode_id')
-                    title = ep.get('title') or ep.get('name') or f"Episode {idx+1}"
-                    video_url = ep.get('video_url') or ep.get('play_url') or ep.get('url')
-
-                    if not video_url and eid:
-                        base_url = url.split('?')[0]
-                        video_url = f"{base_url}?eid={eid}"
-
-                    if video_url:
-                        episodes.append({
-                            'title': title,
-                            'url': video_url
-                        })
-        except Exception:
-            pass
-
-    if not episodes:
-        base_url = url.split('?')[0]
-        eids = re.findall(r'eid=([a-zA-Z0-9_-]+)', response.text)
-        unique_eids = list(dict.fromkeys(eids))
-        for idx, eid in enumerate(unique_eids):
-            episodes.append({
-                'title': f"Episode {idx+1}",
-                'url': f"{base_url}?eid={eid}"
-            })
-
-    return {
-        'title': series_title,
-        'episodes': episodes
-    }
 
 def find_episodes_in_dict(d):
     if isinstance(d, dict):
@@ -282,6 +77,171 @@ def find_series_title_in_dict(d):
             if res is not None:
                 return res
     return None
+
+# --- Extraction Engine using Playwright ---
+
+def get_direct_video_url_via_playwright(url, debug_info=None):
+    """Launches headless Chromium, runs JS, and captures the video stream URL."""
+    if '.mp4' in url or '.m3u8' in url:
+        return url, "Direct Input Link"
+        
+    video_url = None
+    proxy_config = get_playwright_proxy()
+    
+    with sync_playwright() as p:
+        launch_kwargs = {
+            "headless": True,
+            "args": ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+        }
+        if proxy_config:
+            launch_kwargs["proxy"] = proxy_config
+            
+        try:
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+            )
+            page = context.new_page()
+            
+            # Intercept background network responses to catch the dynamic video stream URL
+            def handle_response(response):
+                nonlocal video_url
+                r_url = response.url
+                if any(x in r_url.lower() for x in ['.m3u8', '.mp4', 'stream', 'video_url', 'play_url']):
+                    # Filter out static resources
+                    if not any(ext in r_url.lower() for ext in ['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.css', '.js']):
+                        video_url = r_url
+                        
+            page.on("response", handle_response)
+            
+            try:
+                response = page.goto(url, wait_until="networkidle", timeout=25000)
+                if response and response.status in [301, 302, 307, 308] and 't.me' in response.header_value('location'):
+                    return None, "Anti-bot redirect to Telegram. Datacenter IP is blocked. Proxy is required."
+                
+                # Wait 5 seconds for the player scripts to execute and load media sources
+                page.wait_for_timeout(5000)
+            except Exception as e:
+                if debug_info is not None:
+                    debug_info['html_preview'] = f"Navigation timeout/error: {str(e)}"
+                    
+            # Fallback 1: Extract from the DOM <video> element
+            if not video_url:
+                try:
+                    video_src = page.eval_on_selector("video", "el => el.src")
+                    if video_src and not video_src.startswith("blob:"):
+                        video_url = video_src
+                except Exception:
+                    pass
+                    
+            # Fallback 2: Extract from <video><source> tag
+            if not video_url:
+                try:
+                    video_src = page.eval_on_selector("video source", "el => el.src")
+                    if video_src and not video_src.startswith("blob:"):
+                        video_url = video_src
+                except Exception:
+                    pass
+                    
+            if debug_info is not None and not video_url:
+                debug_info['html_preview'] = page.content()[:400]
+                
+            browser.close()
+        except Exception as e:
+            return None, f"Playwright Engine Error: {str(e)}"
+            
+    if video_url:
+        return video_url, "Playwright Browser Emulation"
+    return None, "No active media stream found on page"
+
+def parse_xgshort_series_via_playwright(url, debug_info=None):
+    """Loads the SPA series page and extracts dynamic list of episodes."""
+    episodes = []
+    series_title = "Short Drama"
+    proxy_config = get_playwright_proxy()
+    
+    with sync_playwright() as p:
+        launch_kwargs = {
+            "headless": True,
+            "args": ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+        }
+        if proxy_config:
+            launch_kwargs["proxy"] = proxy_config
+            
+        try:
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+            )
+            page = context.new_page()
+            
+            # Intercept API responses containing episode list data
+            def handle_response(response):
+                nonlocal episodes, series_title
+                try:
+                    if "application/json" in response.headers.get("content-type", ""):
+                        data = response.json()
+                        found_eps = find_episodes_in_dict(data)
+                        found_title = find_series_title_in_dict(data)
+                        if found_title:
+                            series_title = found_title
+                        if found_eps:
+                            for idx, ep in enumerate(found_eps):
+                                eid = ep.get('eid') or ep.get('id') or ep.get('episode_id')
+                                title = ep.get('title') or ep.get('name') or f"Episode {idx+1}"
+                                video_url = ep.get('video_url') or ep.get('play_url') or ep.get('url')
+                                
+                                if not video_url and eid:
+                                    base_url = url.split('?')[0]
+                                    video_url = f"{base_url}?eid={eid}"
+                                    
+                                if video_url:
+                                    episodes.append({
+                                        'title': title,
+                                        'url': video_url
+                                    })
+                except Exception:
+                    pass
+
+            page.on("response", handle_response)
+            
+            try:
+                page.goto(url, wait_until="networkidle", timeout=25000)
+                page.wait_for_timeout(5000) # Wait for API execution
+            except Exception:
+                pass
+                
+            # Fallback: Scrape the parsed DOM links containing 'eid='
+            if not episodes:
+                try:
+                    html_content = page.content()
+                    soup = BeautifulSoup(html_content, 'html.parser')
+                    title_tag = soup.find('title')
+                    if title_tag:
+                        series_title = title_tag.string.strip()
+                        
+                    links = page.eval_on_selector_all("a", "elements => elements.map(el => el.href)")
+                    unique_links = list(dict.fromkeys(links))
+                    idx = 1
+                    for link in unique_links:
+                        if 'eid=' in link:
+                            episodes.append({
+                                'title': f"Episode {idx}",
+                                'url': link
+                            })
+                            idx += 1
+                except Exception:
+                    pass
+                    
+            browser.close()
+        except Exception as e:
+            if debug_info is not None:
+                debug_info['html_preview'] = f"Playwright Error: {str(e)}"
+                
+    return {
+        'title': series_title,
+        'episodes': episodes
+    }
 
 # --- Downloading Engine ---
 
@@ -314,19 +274,17 @@ async def download_single(client, message: Message):
         return
 
     target_url = message.command[1]
-    status = await message.reply_text("Analyzing web page elements...")
+    status = await message.reply_text("Opening headless browser to load SPA contents...")
 
     debug_info = {}
-    direct_url, method = get_direct_video_url(target_url, debug_info)
+    direct_url, method = get_direct_video_url_via_playwright(target_url, debug_info)
 
     if not direct_url:
-        sc = debug_info.get('status_code', 'Unknown')
-        preview = debug_info.get('html_preview', 'No content received').replace('<', '&lt;').replace('>', '&gt;')
+        preview = debug_info.get('html_preview', 'No content captured').replace('<', '&lt;').replace('>', '&gt;')
         err_msg = (
             f"❌ **Failed to extract video stream!**\n\n"
-            f"**Reason:** {method}\n"
-            f"**HTTP Status Code:** {sc}\n\n"
-            f"**HTML Preview:**\n`{preview}`"
+            f"**Reason:** {method}\n\n"
+            f"**Debug Log:**\n`{preview}`"
         )
         await status.edit_text(err_msg)
         return
@@ -346,7 +304,7 @@ async def download_single(client, message: Message):
             os.remove(output_filename) 
             await status.delete()
         else:
-            await status.edit_text("Download completed but physical file was not created.")
+            await status.edit_text("Download succeeded but file path was empty.")
     except Exception as e:
         await status.edit_text(f"An error occurred during download: {str(e)}")
         if os.path.exists(output_filename):
@@ -359,18 +317,16 @@ async def download_batch(client, message: Message):
         return
 
     series_url = message.command[1]
-    status = await message.reply_text("Analyzing series configuration...")
+    status = await message.reply_text("Opening headless browser to read series data...")
 
     debug_info = {}
-    series_data = parse_xgshort_series(series_url, debug_info)
+    series_data = parse_xgshort_series_via_playwright(series_url, debug_info)
     
     if not series_data or not series_data.get('episodes'):
-        sc = debug_info.get('status_code', 'Unknown')
-        preview = debug_info.get('html_preview', 'No content received').replace('<', '&lt;').replace('>', '&gt;')
+        preview = debug_info.get('html_preview', 'No content captured').replace('<', '&lt;').replace('>', '&gt;')
         err_msg = (
             f"❌ **Could not extract series structure.**\n\n"
-            f"**HTTP Status Code:** {sc}\n\n"
-            f"**HTML Preview:**\n`{preview}`"
+            f"**Debug Log:**\n`{preview}`"
         )
         await status.edit_text(err_msg)
         return
@@ -390,10 +346,10 @@ async def download_batch(client, message: Message):
 
         try:
             ep_debug = {}
-            direct_url, method = get_direct_video_url(ep_url, ep_debug)
+            direct_url, method = get_direct_video_url_via_playwright(ep_url, ep_debug)
             
             if not direct_url:
-                await step_msg.edit_text(f"❌ Failed to extract stream link for {ep_title}. skipping.")
+                await step_msg.edit_text(f"❌ Failed to extract stream link for {ep_title}. Skipping.")
                 continue
 
             download_and_save(direct_url, temp_file)
@@ -407,7 +363,7 @@ async def download_batch(client, message: Message):
                 os.remove(temp_file) 
                 await step_msg.delete()
             else:
-                await step_msg.edit_text(f"Failed to compile: {ep_title}")
+                await step_msg.edit_text(f"Failed to download: {ep_title}")
         except Exception as e:
             await step_msg.edit_text(f"Failed to process {ep_title}: {str(e)}")
             if os.path.exists(temp_file):
