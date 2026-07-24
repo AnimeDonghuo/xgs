@@ -11,9 +11,13 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 
 # --- Configuration ---
-API_ID = int(os.environ.get("API_ID", ""))
-API_HASH = os.environ.get("API_HASH", "")
+API_ID = int(os.environ.get("API_ID", "1234567"))
+API_HASH = os.environ.get("API_HASH", "your_api_hash_here")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token_here")
+
+# Proxy Configuration (Optional: set PROXY in Koyeb Environment Variables)
+# e.g., PROXY = "http://username:password@ip:port" or "socks5://ip:port"
+PROXY = os.environ.get("PROXY", "")
 
 app = Client("xgshort_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -36,22 +40,26 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-# --- Upgraded Extraction Engine ---
+# --- Helper Functions ---
+
+def get_requests_proxies():
+    if PROXY:
+        return {
+            "http": PROXY,
+            "https": PROXY
+        }
+    return None
 
 def find_urls_in_dict_recursively(d, base_url, found=None):
-    """Recursively scans a JSON-like dictionary for key-value pairs representing video links."""
     if found is None:
         found = []
     if isinstance(d, dict):
         for k, v in d.items():
             k_lower = k.lower()
             if isinstance(v, str):
-                # Look for potential links
                 if v.startswith('http://') or v.startswith('https://') or v.startswith('/'):
-                    # Match keys commonly used for stream pathways
                     if any(x in k_lower for x in ['video', 'play', 'src', 'stream', 'source', 'url', 'm3u8', 'mp4', 'file']):
                         abs_url = urljoin(base_url, v)
-                        # Filter out non-video assets
                         if not any(abs_url.lower().endswith(ext) or ext + '?' in abs_url.lower() for ext in ['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.css', '.js']):
                             found.append((abs_url, k))
             else:
@@ -62,7 +70,6 @@ def find_urls_in_dict_recursively(d, base_url, found=None):
     return found
 
 def get_direct_video_url(url, debug_info=None):
-    """Extracts direct video files using multiple tag and pattern-matching strategies."""
     if '.mp4' in url or '.m3u8' in url:
         return url, "Direct Input Link"
         
@@ -74,8 +81,36 @@ def get_direct_video_url(url, debug_info=None):
         'Origin': 'https://m.xgshort.com'
     }
     
+    proxies = get_requests_proxies()
+    
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        # Disable default automatic redirects to catch anti-bot redirects to t.me
+        response = requests.get(url, headers=headers, timeout=10, allow_redirects=False, proxies=proxies)
+        
+        if debug_info is not None:
+            debug_info['status_code'] = response.status_code
+            
+        # Manually trace redirections to catch blocks early
+        redirect_count = 0
+        while response.status_code in [301, 302, 303, 307, 308] and redirect_count < 5:
+            redirect_url = response.headers.get('Location', '')
+            if not redirect_url:
+                break
+                
+            redirect_url = urljoin(url, redirect_url)
+            
+            # If redirected to Telegram, stop the request and report the datacenter block
+            if 't.me' in redirect_url:
+                return None, (
+                    f"Anti-bot redirect detected! The website redirected the bot to their Telegram channel ({redirect_url}). "
+                    "This occurs when the website blocks hosting/datacenter IP ranges (like Koyeb). "
+                    "Setting up a residential or clean HTTP proxy under the 'PROXY' environment variable on Koyeb is recommended to bypass this."
+                )
+                
+            url = redirect_url
+            response = requests.get(url, headers=headers, timeout=10, allow_redirects=False, proxies=proxies)
+            redirect_count += 1
+            
         if debug_info is not None:
             debug_info['status_code'] = response.status_code
             debug_info['html_preview'] = response.text[:400]
@@ -85,14 +120,14 @@ def get_direct_video_url(url, debug_info=None):
             
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Strategy 1: Check native HTML5 `<video>` tags
+        # Strategy 1: Check native HTML5 <video> tags
         video_tag = soup.find('video')
         if video_tag:
             src = video_tag.get('src')
             if src:
                 return urljoin(url, src), "HTML5 Video Tag"
                 
-        # Strategy 2: Check standard `<source>` elements
+        # Strategy 2: Check standard <source> elements
         source_tag = soup.find('source')
         if source_tag:
             src = source_tag.get('src')
@@ -137,8 +172,26 @@ def parse_xgshort_series(url, debug_info=None):
         'Referer': 'https://m.xgshort.com/',
         'Origin': 'https://m.xgshort.com'
     }
+    proxies = get_requests_proxies()
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(url, headers=headers, timeout=10, allow_redirects=False, proxies=proxies)
+        
+        # Trace redirect to prevent timeouts on parse
+        redirect_count = 0
+        while response.status_code in [301, 302, 303, 307, 308] and redirect_count < 5:
+            redirect_url = response.headers.get('Location', '')
+            if not redirect_url:
+                break
+            redirect_url = urljoin(url, redirect_url)
+            if 't.me' in redirect_url:
+                if debug_info is not None:
+                    debug_info['status_code'] = response.status_code
+                    debug_info['html_preview'] = f"Anti-bot redirect to Telegram ({redirect_url}) detected. Please set up a PROXY environment variable on Koyeb."
+                return None
+            url = redirect_url
+            response = requests.get(url, headers=headers, timeout=10, allow_redirects=False, proxies=proxies)
+            redirect_count += 1
+
         if debug_info is not None:
             debug_info['status_code'] = response.status_code
             debug_info['html_preview'] = response.text[:400]
@@ -240,6 +293,8 @@ def download_and_save(video_url, output_path):
         'quiet': True,
         'no_warnings': True,
     }
+    if PROXY:
+        ydl_opts['proxy'] = PROXY
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([video_url])
 
@@ -268,7 +323,7 @@ async def download_single(client, message: Message):
         sc = debug_info.get('status_code', 'Unknown')
         preview = debug_info.get('html_preview', 'No content received').replace('<', '&lt;').replace('>', '&gt;')
         err_msg = (
-            f"❌ **Failed to extract video stream!**\n"
+            f"❌ **Failed to extract video stream!**\n\n"
             f"**Reason:** {method}\n"
             f"**HTTP Status Code:** {sc}\n\n"
             f"**HTML Preview:**\n`{preview}`"
@@ -313,7 +368,7 @@ async def download_batch(client, message: Message):
         sc = debug_info.get('status_code', 'Unknown')
         preview = debug_info.get('html_preview', 'No content received').replace('<', '&lt;').replace('>', '&gt;')
         err_msg = (
-            f"❌ **Could not extract series structure.**\n"
+            f"❌ **Could not extract series structure.**\n\n"
             f"**HTTP Status Code:** {sc}\n\n"
             f"**HTML Preview:**\n`{preview}`"
         )
@@ -338,7 +393,7 @@ async def download_batch(client, message: Message):
             direct_url, method = get_direct_video_url(ep_url, ep_debug)
             
             if not direct_url:
-                await step_msg.edit_text(f"❌ Failed to extract stream link for {ep_title}. Skipping.")
+                await step_msg.edit_text(f"❌ Failed to extract stream link for {ep_title}. skipping.")
                 continue
 
             download_and_save(direct_url, temp_file)
