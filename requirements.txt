@@ -1,0 +1,5 @@
+pyrogram
+tgcrypto
+yt-dlp
+beautifulsoup4
+requests
