@@ -4,14 +4,15 @@ import json
 import threading
 import requests
 import yt_dlp
+from urllib.parse import urljoin
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 from bs4 import BeautifulSoup
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# --- Configuration (Loaded from Environment Variables for Security on Koyeb) ---
-API_ID = int(os.environ.get("API_ID", "26826540"))
-API_HASH = os.environ.get("API_HASH", "32d454f51fc7b3b3c7d51c4f80f628b5")
+# --- Configuration ---
+API_ID = int(os.environ.get("API_ID", ""))
+API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token_here")
 
 app = Client("xgshort_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -33,86 +34,118 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-# Start health check server in background thread to satisfy Koyeb
 threading.Thread(target=run_health_server, daemon=True).start()
 
-# --- Helper Functions for Parsing ---
+# --- Upgraded Extraction Engine ---
 
-def find_urls_in_dict(d, found=None):
+def find_urls_in_dict_recursively(d, base_url, found=None):
+    """Recursively scans a JSON-like dictionary for key-value pairs representing video links."""
     if found is None:
         found = []
     if isinstance(d, dict):
         for k, v in d.items():
+            k_lower = k.lower()
             if isinstance(v, str):
-                if v.startswith('http') and (v.endswith('.mp4') or '.m3u8' in v or 'video' in k or 'play_url' in k):
-                    found.append(v)
+                # Look for potential links
+                if v.startswith('http://') or v.startswith('https://') or v.startswith('/'):
+                    # Match keys commonly used for stream pathways
+                    if any(x in k_lower for x in ['video', 'play', 'src', 'stream', 'source', 'url', 'm3u8', 'mp4', 'file']):
+                        abs_url = urljoin(base_url, v)
+                        # Filter out non-video assets
+                        if not any(abs_url.lower().endswith(ext) or ext + '?' in abs_url.lower() for ext in ['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.css', '.js']):
+                            found.append((abs_url, k))
             else:
-                find_urls_in_dict(v, found)
+                find_urls_in_dict_recursively(v, base_url, found)
     elif isinstance(d, list):
         for item in d:
-            find_urls_in_dict(item, found)
+            find_urls_in_dict_recursively(item, base_url, found)
     return found
 
-def find_episodes_in_dict(d):
-    if isinstance(d, dict):
-        for k, v in d.items():
-            if k == 'episodes' and isinstance(v, list):
-                return v
-            res = find_episodes_in_dict(v)
-            if res is not None:
-                return res
-    elif isinstance(d, list):
-        for item in d:
-            res = find_episodes_in_dict(item)
-            if res is not None:
-                return res
-    return None
-
-def find_series_title_in_dict(d):
-    if isinstance(d, dict):
-        for k, v in d.items():
-            if k in ['seriesName', 'series_title', 'series_name', 'name'] and isinstance(v, str):
-                return v
-            res = find_series_title_in_dict(v)
-            if res is not None:
-                return res
-    elif isinstance(d, list):
-        for item in d:
-            res = find_series_title_in_dict(item)
-            if res is not None:
-                return res
-    return None
-
-def get_direct_video_url(url):
+def get_direct_video_url(url, debug_info=None):
+    """Extracts direct video files using multiple tag and pattern-matching strategies."""
     if '.mp4' in url or '.m3u8' in url:
-        return url
+        return url, "Direct Input Link"
+        
     headers = {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://m.xgshort.com/',
+        'Origin': 'https://m.xgshort.com'
     }
+    
     try:
         response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            next_script = soup.find('script', id='__NEXT_DATA__')
-            if next_script:
+        if debug_info is not None:
+            debug_info['status_code'] = response.status_code
+            debug_info['html_preview'] = response.text[:400]
+            
+        if response.status_code != 200:
+            return None, f"HTTP Status {response.status_code}"
+            
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Strategy 1: Check native HTML5 `<video>` tags
+        video_tag = soup.find('video')
+        if video_tag:
+            src = video_tag.get('src')
+            if src:
+                return urljoin(url, src), "HTML5 Video Tag"
+                
+        # Strategy 2: Check standard `<source>` elements
+        source_tag = soup.find('source')
+        if source_tag:
+            src = source_tag.get('src')
+            if src:
+                return urljoin(url, src), "HTML5 Source Tag"
+                
+        # Strategy 3: Check NextJS React hydrated structures
+        next_script = soup.find('script', id='__NEXT_DATA__')
+        if next_script:
+            try:
                 data = json.loads(next_script.string)
-                urls = find_urls_in_dict(data)
-                if urls:
-                    return urls[0]
-            urls = re.findall(r'https?://[^\s"\']+\.(?:mp4|m3u8)[^\s"\']*', response.text)
-            if urls:
-                return urls[0]
-    except Exception:
-        pass
-    return url
+                found_pairs = find_urls_in_dict_recursively(data, url)
+                if found_pairs:
+                    return found_pairs[0][0], f"NextJS State Key: {found_pairs[0][1]}"
+            except Exception:
+                pass
+                
+        # Strategy 4: Raw text javascript variables pattern scanner
+        for script in soup.find_all('script'):
+            if script.string:
+                patterns = [
+                    r'["\'](?:video|play|src|source|stream|url)["\']\s*[:=]\s*["\'](https?://[^"\']+|/[^"\']+)["\']',
+                    r'(?:video|play|src|source|stream|url)\s*=\s*["\'](https?://[^"\']+|/[^"\']+)["\']'
+                ]
+                for pattern in patterns:
+                    matches = re.findall(pattern, script.string, re.IGNORECASE)
+                    for match in matches:
+                        abs_url = urljoin(url, match)
+                        if not any(abs_url.lower().endswith(ext) or ext + '?' in abs_url.lower() for ext in ['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.css', '.js']):
+                            return abs_url, "Script Variable Extract"
+                            
+    except Exception as e:
+        return None, f"Network Exception: {str(e)}"
+        
+    return None, "Unable to extract playable media stream"
 
-def parse_xgshort_series(url):
+def parse_xgshort_series(url, debug_info=None):
     headers = {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://m.xgshort.com/',
+        'Origin': 'https://m.xgshort.com'
     }
     try:
         response = requests.get(url, headers=headers, timeout=15)
-    except Exception:
+        if debug_info is not None:
+            debug_info['status_code'] = response.status_code
+            debug_info['html_preview'] = response.text[:400]
+    except Exception as e:
+        if debug_info is not None:
+            debug_info['status_code'] = 'Exception'
+            debug_info['html_preview'] = str(e)
         return None
 
     if response.status_code != 200:
@@ -152,10 +185,9 @@ def parse_xgshort_series(url):
         except Exception:
             pass
 
-    # Fallback if dictionary structural parsing fails
     if not episodes:
         base_url = url.split('?')[0]
-        eids = re.findall(r'eid=([a-zA-Z0-9]+)', response.text)
+        eids = re.findall(r'eid=([a-zA-Z0-9_-]+)', response.text)
         unique_eids = list(dict.fromkeys(eids))
         for idx, eid in enumerate(unique_eids):
             episodes.append({
@@ -168,10 +200,39 @@ def parse_xgshort_series(url):
         'episodes': episodes
     }
 
+def find_episodes_in_dict(d):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if k == 'episodes' and isinstance(v, list):
+                return v
+            res = find_episodes_in_dict(v)
+            if res is not None:
+                return res
+    elif isinstance(d, list):
+        for item in d:
+            res = find_episodes_in_dict(item)
+            if res is not None:
+                return res
+    return None
+
+def find_series_title_in_dict(d):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if k in ['seriesName', 'series_title', 'series_name', 'name'] and isinstance(v, str):
+                return v
+            res = find_series_title_in_dict(v)
+            if res is not None:
+                return res
+    elif isinstance(d, list):
+        for item in d:
+            res = find_series_title_in_dict(item)
+            if res is not None:
+                return res
+    return None
+
 # --- Downloading Engine ---
 
 def download_and_save(video_url, output_path):
-    """Downloads streaming link using yt-dlp to temporary local storage."""
     ydl_opts = {
         'outtmpl': output_path,
         'format': 'bestvideo+bestaudio/best',
@@ -198,29 +259,43 @@ async def download_single(client, message: Message):
         return
 
     target_url = message.command[1]
-    status = await message.reply_text("Retrieving single episode data...")
+    status = await message.reply_text("Analyzing web page elements...")
+
+    debug_info = {}
+    direct_url, method = get_direct_video_url(target_url, debug_info)
+
+    if not direct_url:
+        sc = debug_info.get('status_code', 'Unknown')
+        preview = debug_info.get('html_preview', 'No content received').replace('<', '&lt;').replace('>', '&gt;')
+        err_msg = (
+            f"❌ **Failed to extract video stream!**\n"
+            f"**Reason:** {method}\n"
+            f"**HTTP Status Code:** {sc}\n\n"
+            f"**HTML Preview:**\n`{preview}`"
+        )
+        await status.edit_text(err_msg)
+        return
+
+    output_filename = "episode.mp4"
+    await status.edit_text(f"Detected stream via **{method}**.\nDownloading media file...")
 
     try:
-        direct_url = get_direct_video_url(target_url)
-        output_filename = "episode.mp4"
-        
-        await status.edit_text("Downloading video...")
         download_and_save(direct_url, output_filename)
 
         if os.path.exists(output_filename):
             await status.edit_text("Uploading file to Telegram...")
             await message.reply_video(
                 video=output_filename,
-                caption="Here is your requested episode."
+                caption=f"Source: [Link]({target_url})\nMethod: {method}"
             )
-            os.remove(output_filename) # Free Koyeb storage immediately
+            os.remove(output_filename) 
             await status.delete()
         else:
-            await status.edit_text("Could not download the episode. Check if the link is correct.")
+            await status.edit_text("Download completed but physical file was not created.")
     except Exception as e:
-        await status.edit_text(f"An error occurred: {str(e)}")
-        if os.path.exists("episode.mp4"):
-            os.remove("episode.mp4")
+        await status.edit_text(f"An error occurred during download: {str(e)}")
+        if os.path.exists(output_filename):
+            os.remove(output_filename)
 
 @app.on_message(filters.command("batch"))
 async def download_batch(client, message: Message):
@@ -231,9 +306,18 @@ async def download_batch(client, message: Message):
     series_url = message.command[1]
     status = await message.reply_text("Analyzing series configuration...")
 
-    series_data = parse_xgshort_series(series_url)
+    debug_info = {}
+    series_data = parse_xgshort_series(series_url, debug_info)
+    
     if not series_data or not series_data.get('episodes'):
-        await status.edit_text("Could not extract series structure. Ensure the link points to a valid series page.")
+        sc = debug_info.get('status_code', 'Unknown')
+        preview = debug_info.get('html_preview', 'No content received').replace('<', '&lt;').replace('>', '&gt;')
+        err_msg = (
+            f"❌ **Could not extract series structure.**\n"
+            f"**HTTP Status Code:** {sc}\n\n"
+            f"**HTML Preview:**\n`{preview}`"
+        )
+        await status.edit_text(err_msg)
         return
 
     episodes = series_data['episodes']
@@ -250,7 +334,13 @@ async def download_batch(client, message: Message):
         temp_file = f"temp_ep_{i}.mp4"
 
         try:
-            direct_url = get_direct_video_url(ep_url)
+            ep_debug = {}
+            direct_url, method = get_direct_video_url(ep_url, ep_debug)
+            
+            if not direct_url:
+                await step_msg.edit_text(f"❌ Failed to extract stream link for {ep_title}. Skipping.")
+                continue
+
             download_and_save(direct_url, temp_file)
 
             if os.path.exists(temp_file):
@@ -259,10 +349,10 @@ async def download_batch(client, message: Message):
                     video=temp_file,
                     caption=f"Series: {title}\n{ep_title}"
                 )
-                os.remove(temp_file) # Crucial to free disk space immediately
+                os.remove(temp_file) 
                 await step_msg.delete()
             else:
-                await step_msg.edit_text(f"Failed to download: {ep_title}")
+                await step_msg.edit_text(f"Failed to compile: {ep_title}")
         except Exception as e:
             await step_msg.edit_text(f"Failed to process {ep_title}: {str(e)}")
             if os.path.exists(temp_file):
